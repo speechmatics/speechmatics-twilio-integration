@@ -372,7 +372,7 @@ export class CallSession {
       if (data.message === "AddPartialTranscript") {
         // Stub - wire partials here if you want to render them (live UI,
         // LLM prompt, agent-assist, etc.). Example:
-        //   const text = data.results.map(r => r.alternatives?.[0].content).join(" ");
+        //   const text = data.metadata.transcript;
         //   const channel = data.channel ?? "?";
         return;
       }
@@ -390,7 +390,7 @@ export class CallSession {
         language: LANGUAGE,
         max_delay: 0.7,
         enable_partials: true,
-        operating_point: "enhanced",
+        model: "enhanced",
         diarization: "channel",
         channel_diarization_labels: [...CHANNELS],
       },
@@ -418,11 +418,12 @@ export class CallSession {
     }
   }
 
-  private handleFinal(msg: {
-    results: Array<{ alternatives?: Array<{ content: string }> }>;
-    channel?: string;
-  }): void {
-    const text = msg.results.map((r) => r.alternatives?.[0]?.content ?? "").join(" ");
+  private handleFinal(msg: { metadata: { transcript: string }; channel?: string }): void {
+    // metadata.transcript is the SDK's pre-formatted text. Joining results[]
+    // by hand would put a space before every punctuation result ("today ?").
+    // It is built for concatenation: each chunk already carries its own
+    // trailing space, so consecutive chunks are appended with no separator.
+    const text = msg.metadata.transcript;
     if (!text) return;
 
     const channel = msg.channel ?? "?";
@@ -433,7 +434,7 @@ export class CallSession {
     } else if (channel !== this.lastFinalChannel) {
       process.stdout.write(`\n${label} ${text}`);
     } else {
-      process.stdout.write(` ${text}`);
+      process.stdout.write(text);
     }
     this.lastFinalChannel = channel;
   }

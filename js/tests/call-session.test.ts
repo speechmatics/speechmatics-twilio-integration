@@ -266,6 +266,80 @@ describe("CallSession.enqueue - start-of-call race", () => {
   });
 });
 
+describe("CallSession.handleFinal", () => {
+  it("prints the SDK's formatted transcript, not a space-joined results[]", () => {
+    /**
+     * Scenario: A final transcript containing punctuation results
+     *   Given an AddTranscript whose results include separate punctuation
+     *         entries and whose metadata.transcript is already formatted
+     *    When the session handles it
+     *    Then the console shows "Hello there. How are you?"
+     *     And there is no space before the full stop or question mark
+     *
+     * Purpose: punctuation arrives as its own result, so joining results[]
+     * on " " prints "Hello there . How are you ?". metadata.transcript is
+     * the SDK's own concatenation and is the source of truth.
+     */
+    const session = new CallSession();
+    const write = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (session as any).handleFinal({
+        channel: "inbound",
+        metadata: { transcript: "Hello there. How are you?" },
+        results: [
+          { type: "word", alternatives: [{ content: "Hello" }] },
+          { type: "word", alternatives: [{ content: "there" }] },
+          { type: "punctuation", alternatives: [{ content: "." }] },
+          { type: "word", alternatives: [{ content: "How" }] },
+          { type: "word", alternatives: [{ content: "are" }] },
+          { type: "word", alternatives: [{ content: "you" }] },
+          { type: "punctuation", alternatives: [{ content: "?" }] },
+        ],
+      });
+
+      const printed = write.mock.calls.map((call) => String(call[0])).join("");
+      expect(printed).toContain("Hello there. How are you?");
+      expect(printed).not.toContain(" .");
+      expect(printed).not.toContain(" ?");
+    } finally {
+      write.mockRestore();
+    }
+  });
+});
+
+describe("CallSession.handleFinal - consecutive finals", () => {
+  it("does not add a second space between finals on the same channel", () => {
+    /**
+     * Scenario: Several finals arrive in a row on one channel
+     *   Given AddTranscript chunks whose metadata.transcript each end in
+     *         a trailing space, as the server sends them
+     *    When the session handles them back to back
+     *    Then the line reads "This call is being transcribed " with
+     *         single spaces between words
+     *
+     * Purpose: the chunks are built for plain concatenation. Adding our
+     * own separator on top printed "This call  is  being  transcribed".
+     */
+    const session = new CallSession();
+    const write = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    try {
+      for (const transcript of ["This call ", "is ", "being ", "transcribed "]) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (session as any).handleFinal({ channel: "outbound", metadata: { transcript } });
+      }
+
+      const printed = write.mock.calls.map((call) => String(call[0])).join("");
+      expect(printed).toBe("[outbound] This call is being transcribed ");
+      expect(printed).not.toMatch(/\S {2,}\S/);
+    } finally {
+      write.mockRestore();
+    }
+  });
+});
+
 describe("CallSession.close", () => {
   it("sends EndOfChannel for each channel then stops recognition", async () => {
     /**
