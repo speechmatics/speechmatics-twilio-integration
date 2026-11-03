@@ -66,13 +66,17 @@ Console.
 [twilio] incoming Media Streams connection
 [twilio] protocol handshake ok
 [twilio] call started - stream=MZxxx... call=CAxxx... tracks=["inbound","outbound"]
-[inbound ] Hello there. How are you doing today?
-[outbound] I'm doing pretty well thanks.
+[outbound] This call is being transcribed.
+[inbound ] Hello. Can you hear me?
+[outbound] Hey, hey. Yes, loud and clear.
+[inbound ] Awesome.
 [twilio] call stopped (stream=MZxxx...)
 ```
 
 - **inbound** = the person who called the Twilio number.
-- **outbound** = the person the Twilio number bridged to via `<Dial>`.
+- **outbound** = audio Twilio sends to the caller.
+- **Transcripts from the two sides interleave** as they arrive, so a
+  sentence can be split across lines. Closing punctuation may land on a later line.
 
 ## Key design choices
 

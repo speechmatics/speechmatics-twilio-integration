@@ -429,6 +429,10 @@ export class CallSession {
       transcription_config: {
         language: LANGUAGE,
         max_delay: 0.7,
+        // Asks the server to send AddPartialTranscript. The handler above is
+        // a deliberate stub - how to use partials (live UI, agent-assist,
+        // LLM prompt) is up to whoever adapts this. Set to false if you
+        // don't wire them in, to save the extra messages.
         enable_partials: true,
         model: "enhanced",
         diarization: "channel",
@@ -587,6 +591,10 @@ export function buildTwiml(streamUrl: string, forwardTo: string): string {
   const response = new twilio.twiml.VoiceResponse();
   const start = response.start();
   start.stream({ url: streamUrl, track: "both_tracks" });
+  // `language` here is Twilio's text-to-speech accent for the greeting only.
+  // It is independent of LANGUAGE (the transcription language sent to
+  // Speechmatics), so changing one does not change the other. The Python
+  // proxy uses "en" for the greeting.
   response.say(
     { voice: "woman", language: "en-GB" },
     "This call is being transcribed.",
