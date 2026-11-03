@@ -2,6 +2,7 @@
   "name": "speechmatics-twilio-integration-js",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Node.js reference: Twilio Voice <-> Speechmatics Realtime proxy (multi-channel).",
   "type": "module",
   "engines": {
