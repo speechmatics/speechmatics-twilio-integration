@@ -107,6 +107,28 @@ function checkEnvVars(): void {
   }
 }
 
+/**
+ * Prove the Speechmatics key works before anything else is set up.
+ *
+ * Without this, a bad key only surfaces on the first call - after ngrok is
+ * up and the Twilio number has been repointed - so everything looks healthy
+ * except the one thing that matters. Minting a token is the same request
+ * that fails for an invalid key at call time, so it is a faithful check.
+ * The token is discarded; each call mints its own.
+ */
+export async function checkSpeechmaticsKey(): Promise<void> {
+  try {
+    await createSpeechmaticsJWT({ type: "rt", apiKey: SM_API_KEY as string, ttl: 60 });
+  } catch (err) {
+    console.error(
+      `Could not authenticate with Speechmatics: ${err instanceof Error ? err.message : String(err)}\n` +
+        `Check SPEECHMATICS_API_KEY in .env (and that api.speechmatics.com is reachable). ` +
+        `Nothing has been started and your Twilio number has not been changed.`,
+    );
+    process.exit(1);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // MultiChannelRealtimeClient
 //
@@ -343,13 +365,31 @@ export class CallSession {
   }
 
   private async run(): Promise<void> {
-    if (!SM_API_KEY) throw new Error("SPEECHMATICS_API_KEY missing at runtime");
-
-    const jwt = await createSpeechmaticsJWT({
-      type: "rt",
-      apiKey: SM_API_KEY,
-      ttl: 60,
-    });
+    let jwt: string;
+    try {
+      if (!SM_API_KEY) throw new Error("SPEECHMATICS_API_KEY missing at runtime");
+      jwt = await createSpeechmaticsJWT({
+        type: "rt",
+        apiKey: SM_API_KEY,
+        ttl: 60,
+      });
+    } catch (err) {
+      // start() is fire-and-forget and nothing awaits startPromise until
+      // close(), so a throw here would be an unhandled rejection and kill
+      // the process - and every other call in flight with it. Fail this
+      // call only, and say what to check: the SDK's own message for a bad
+      // key ("Failed to parse JSON response") does not.
+      this.failed = true;
+      if (!this.closed) {
+        console.error(
+          `Speechmatics auth error: ${err instanceof Error ? err.message : String(err)}. ` +
+            `Check SPEECHMATICS_API_KEY. Audio for this call will not be transcribed.`,
+        );
+      }
+      // Account for any frames already buffered; there is no session to send them to.
+      this.drainPending();
+      return;
+    }
 
     this.client = new MultiChannelRealtimeClient();
 
@@ -579,6 +619,9 @@ async function configureTwilioNumber(twimlUrl: string): Promise<void> {
 
 async function main(): Promise<void> {
   checkEnvVars();
+  // Before ngrok and before the Twilio number is repointed, so a bad key
+  // fails here rather than on the first call.
+  await checkSpeechmaticsKey();
 
   const baseUrl = await startNgrokTunnel();
   const wssUrl = baseUrl.replace(/^https:/, "wss:") + "/twilio";
