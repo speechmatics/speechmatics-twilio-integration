@@ -109,13 +109,14 @@ def test_twiml_dial_contains_forward_number():
         catches an accidental swap between the forwarding number and
         the Twilio number.
     """
-    root = _parse(_build_twiml("wss://x/twilio", "+447517209577"))
+    # +44 7700 900xxx is Ofcom's reserved drama range - never a real subscriber.
+    root = _parse(_build_twiml("wss://x/twilio", "+447700900123"))
 
     dial = root.find("./Dial")
     assert dial is not None
 
     # Number must be present verbatim, in E.164 form.
-    assert dial.text == "+447517209577"
+    assert dial.text == "+447700900123"
 
 
 def test_twiml_say_present():
