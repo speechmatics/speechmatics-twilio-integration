@@ -70,8 +70,9 @@ describe("buildTwiml", () => {
      * Purpose: Without <Dial>, the caller hears the greeting and hangs
      * up - no second party, no two-way audio, no multi-channel transcript.
      */
-    const doc = parse(buildTwiml("wss://x/twilio", "+447517209577"));
-    expect(String(doc.Response.Dial)).toBe("+447517209577");
+    // +44 7700 900xxx is Ofcom's reserved drama range - never a real subscriber.
+    const doc = parse(buildTwiml("wss://x/twilio", "+447700900123"));
+    expect(String(doc.Response.Dial)).toBe("+447700900123");
   });
 
   it("includes a <Say> whose text mentions transcription", () => {
