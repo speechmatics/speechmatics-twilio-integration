@@ -38,6 +38,10 @@ describe("CallSession.enqueue", () => {
      * Build a CallSession with its internal RT client swapped for a
      * plain spy. We poke the private fields directly - this is a test
      * harness so escaping visibility is fine.
+     *
+     * `ready` is the flag the session sets once StartRecognition has been
+     * acknowledged; a client alone is not enough to make sends safe, so
+     * these tests set it to model an already-established session.
      */
     const session = new CallSession();
     const spies = {
@@ -47,6 +51,8 @@ describe("CallSession.enqueue", () => {
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (session as any).client = spies;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (session as any).ready = true;
     return { session, spies };
   }
 
@@ -95,6 +101,171 @@ describe("CallSession.enqueue", () => {
   });
 });
 
+describe("CallSession.enqueue - start-of-call race", () => {
+  /**
+   * Build the spy client without attaching it, so the session is in the
+   * state it really occupies for the first few hundred milliseconds of a
+   * call: constructed and started, but with no usable socket yet.
+   */
+  function stubClient() {
+    return {
+      sendChannelAudio: vi.fn(),
+      endChannel: vi.fn(),
+      stopRecognition: vi.fn().mockResolvedValue(undefined),
+    };
+  }
+
+  /**
+   * Promote a session to "ready" exactly the way run() does once
+   * StartRecognition has been acknowledged: attach the client, flip the
+   * flag, then flush the backlog.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function becomeReady(session: CallSession, spies: any) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (session as any).client = spies;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (session as any).ready = true;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (session as any).drainPending();
+  }
+
+  it("buffers frames that arrive before the session is ready, losing none", () => {
+    /**
+     * Scenario: Twilio media arrives during the JWT fetch / RT handshake
+     *   Given a CallSession whose RT client does not exist yet
+     *    When five frames are enqueued on each track
+     *    Then no frame reaches the client while it is unready
+     *     And once the session becomes ready all ten are delivered
+     *     And each channel receives its frames in arrival order
+     *
+     * Purpose: Twilio sends its first media frame ~20 ms after "start",
+     * but createSpeechmaticsJWT() plus a TLS WebSocket handshake takes
+     * hundreds of ms. Before this was buffered, enqueue() returned early
+     * on a null client and silently binned the opening of every single
+     * call. This is the ../python/proxy.py AsyncQueueSource guarantee -
+     * the queues exist from construction, so early audio waits rather
+     * than evaporating.
+     */
+    const session = new CallSession();
+    const spies = stubClient();
+
+    for (let i = 0; i < 5; i += 1) {
+      session.enqueue("inbound", `in${i}`);
+      session.enqueue("outbound", `out${i}`);
+    }
+
+    // Nothing can have been sent - there is no socket to send on.
+    expect(spies.sendChannelAudio).not.toHaveBeenCalled();
+
+    becomeReady(session, spies);
+
+    expect(spies.sendChannelAudio).toHaveBeenCalledTimes(10);
+    const byChannel = (channel: string) =>
+      spies.sendChannelAudio.mock.calls
+        .filter((call: unknown[]) => call[0] === channel)
+        .map((call: unknown[]) => call[1]);
+    expect(byChannel("inbound")).toEqual(["in0", "in1", "in2", "in3", "in4"]);
+    expect(byChannel("outbound")).toEqual(["out0", "out1", "out2", "out3", "out4"]);
+  });
+
+  it("keeps seq_no aligned with what was actually sent", async () => {
+    /**
+     * Scenario: EndOfChannel after a buffered start
+     *   Given three inbound and one outbound frame buffered pre-readiness
+     *    When the session becomes ready and is then closed
+     *    Then endChannel reports last_seq_no 3 for inbound and 1 for outbound
+     *
+     * Purpose: close() passes seqNo as EndOfChannel.last_seq_no, which the
+     * server uses to know when a channel is complete. The counter must
+     * therefore track frames the server was *sent*, not frames Twilio
+     * handed us - a buffered frame counted before delivery would leave the
+     * server waiting forever for audio that never went out.
+     */
+    const session = new CallSession();
+    const spies = stubClient();
+
+    session.enqueue("inbound", "a");
+    session.enqueue("inbound", "b");
+    session.enqueue("inbound", "c");
+    session.enqueue("outbound", "d");
+
+    becomeReady(session, spies);
+
+    // Resolve EndOfTranscript so close() skips its 10-second fallback.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (session as any).eotResolve?.();
+    await session.close();
+
+    expect(spies.endChannel).toHaveBeenCalledWith("inbound", 3);
+    expect(spies.endChannel).toHaveBeenCalledWith("outbound", 1);
+  });
+
+  it("never throws when the socket rejects a frame", () => {
+    /**
+     * Scenario: The RT socket is still CONNECTING when a frame is sent
+     *   Given a ready session whose client throws "WebSocket is not open"
+     *    When a frame is enqueued
+     *    Then enqueue() does not throw
+     *     And the failure is reported on the console
+     *
+     * Purpose: enqueue() is called from inside ws's synchronous
+     * "message" listener, so anything it throws bypasses the promise
+     * chain around handleTwilioCall and becomes an uncaught exception
+     * that takes the whole process - and every concurrent call - down.
+     * Failures must be logged, never raised, and never swallowed.
+     */
+    const session = new CallSession();
+    const spies = stubClient();
+    spies.sendChannelAudio.mockImplementation(() => {
+      throw new Error("WebSocket is not open: readyState 0 (CONNECTING)");
+    });
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (session as any).client = spies;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (session as any).ready = true;
+
+      expect(() => session.enqueue("inbound", "boom")).not.toThrow();
+      expect(errorLog).toHaveBeenCalled();
+    } finally {
+      errorLog.mockRestore();
+    }
+  });
+
+  it("bounds the buffer and complains when it overflows", () => {
+    /**
+     * Scenario: A session that never connects keeps receiving audio
+     *   Given a CallSession that never becomes ready
+     *    When far more frames are enqueued than the per-channel cap
+     *    Then the buffer stops growing at the cap
+     *     And the overflow is reported on the console, not hidden
+     *
+     * Purpose: a hung RT connection must not turn into an unbounded
+     * memory leak - 8 kHz mulaw is 8 KB/s/channel and a Twilio socket can
+     * stay open for hours. Dropping audio is bad, so it has to be loud.
+     */
+    const session = new CallSession();
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      for (let i = 0; i < 1_000; i += 1) {
+        session.enqueue("inbound", `f${i}`);
+      }
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const buffered: string[] = (session as any).pending.inbound;
+      expect(buffered.length).toBeLessThan(1_000);
+      expect(buffered[0]).toBe("f0");
+      expect(errorLog).toHaveBeenCalled();
+    } finally {
+      errorLog.mockRestore();
+    }
+  });
+});
+
 describe("CallSession.close", () => {
   it("sends EndOfChannel for each channel then stops recognition", async () => {
     /**
@@ -117,6 +288,8 @@ describe("CallSession.close", () => {
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (session as any).client = spies;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (session as any).ready = true;
 
     // Simulate a couple of frames on each channel.
     session.enqueue("inbound", "A");
@@ -155,6 +328,8 @@ describe("CallSession.close", () => {
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (session as any).client = spies;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (session as any).ready = true;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (session as any).eotResolve?.();
 

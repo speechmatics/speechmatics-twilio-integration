@@ -82,6 +82,19 @@ export type Channel = (typeof CHANNELS)[number];
 
 const LANGUAGE = "en";
 
+// Twilio starts shipping media ~20 ms after the "start" event, but fetching
+// a JWT and completing the Speechmatics WebSocket handshake takes hundreds
+// of milliseconds. Frames that arrive in that gap are buffered per channel
+// (see CallSession.enqueue) and flushed once the session is ready.
+//
+// Cap: 8 kHz mulaw is 8 KB/s/channel = 50 x 160-byte frames/s, so 750
+// frames is 15 s of audio - comfortably longer than any start-up race the
+// SDK can still win (it abandons StartRecognition after a 10 s timeout,
+// RealtimeClientOptions.connectionTimeout) while bounding a session that
+// never connects to ~165 KB of base64 per channel instead of unbounded
+// growth for the life of the socket.
+const MAX_BUFFERED_FRAMES_PER_CHANNEL = 750;
+
 // ─────────────────────────────────────────────────────────────────────
 // Env validation
 // ─────────────────────────────────────────────────────────────────────
@@ -141,6 +154,23 @@ export class CallSession {
   private eotResolve: (() => void) | null = null;
   private readonly eotPromise: Promise<void>;
 
+  // Per-channel FIFO of base64 frames that arrived before the RT socket was
+  // usable. These queues exist from construction - the same property that
+  // makes ../python/proxy.py immune, where AsyncQueueSource is built in
+  // CallSession.__init__ and buffers until the SDK's reader drains it.
+  private readonly pending: Record<Channel, string[]> = { inbound: [], outbound: [] };
+
+  // True only between RecognitionStarted and the socket closing: the one
+  // window in which sendChannelAudio() is guaranteed not to throw.
+  private ready = false;
+
+  // Latched when the session can never become usable (connect/start failed,
+  // socket closed, or a send threw). Further frames are dropped, loudly,
+  // rather than buffered forever.
+  private failed = false;
+
+  private readonly dropped: Record<Channel, number> = { inbound: 0, outbound: 0 };
+
   constructor() {
     // Track EndOfTranscript arrival so close() can wait for the server
     // to flush any final results before disconnecting.
@@ -154,13 +184,33 @@ export class CallSession {
     this.startPromise = this.run();
   }
 
-  /** Route a base64-encoded audio frame from Twilio to Speechmatics. */
+  /**
+   * Route a base64-encoded audio frame from Twilio to Speechmatics.
+   *
+   * Never throws, and never drops a frame merely for being early. Twilio's
+   * first media frame lands ~20 ms after "start", long before the JWT fetch
+   * and WebSocket handshake finish, so anything arriving before the session
+   * is ready is queued and flushed in order by drainPending(). Sending
+   * eagerly instead would throw "WebSocket is not open: readyState 0
+   * (CONNECTING)" from inside a ws listener and take the process down.
+   */
   enqueue(track: string, base64Payload: string): void {
-    if (this.closed || !this.isKnownChannel(track) || !this.client) {
+    if (this.closed || !this.isKnownChannel(track)) {
       return;
     }
-    this.seqNo[track] += 1;
-    this.client.sendChannelAudio(track, base64Payload);
+    if (this.ready) {
+      // A frame the socket refuses is still a frame lost - count it, so
+      // close()'s tally reflects every gap in the transcript.
+      if (!this.sendFrame(track, base64Payload)) {
+        this.dropped[track] += 1;
+      }
+      return;
+    }
+    if (this.failed || this.pending[track].length >= MAX_BUFFERED_FRAMES_PER_CHANNEL) {
+      this.noteDrop(track);
+      return;
+    }
+    this.pending[track].push(base64Payload);
   }
 
   /**
@@ -171,7 +221,19 @@ export class CallSession {
     if (this.closed) return;
     this.closed = true;
 
+    // Let the start sequence settle before tearing down. On a very short
+    // call the socket may still be coming up with frames queued behind it;
+    // EndOfChannel has to follow that audio, not precede it. This mirrors
+    // python's close(), which signals EOF on the queues and then awaits the
+    // reader task. Bounded by the SDK's 10 s StartRecognition timeout.
+    if (this.startPromise) {
+      await this.startPromise.catch(() => undefined);
+    }
+
     if (this.client) {
+      // Anything still queued goes out now, before the seq_no below is read.
+      this.drainPending();
+
       for (const channel of CHANNELS) {
         try {
           this.client.endChannel(channel, this.seqNo[channel]);
@@ -196,14 +258,88 @@ export class CallSession {
       process.stdout.write("\n");
     }
 
-    if (this.startPromise) {
-      // Ensure the run task settles before returning.
-      await this.startPromise.catch(() => undefined);
+    const lost = this.dropped.inbound + this.dropped.outbound;
+    if (lost > 0) {
+      console.error(
+        `[speechmatics] call ended having dropped ${lost} audio frame(s) ` +
+          `(inbound=${this.dropped.inbound}, outbound=${this.dropped.outbound}).`,
+      );
     }
   }
 
   private isKnownChannel(track: string): track is Channel {
     return (CHANNELS as readonly string[]).includes(track);
+  }
+
+  /**
+   * Send one frame and advance that channel's sequence counter.
+   *
+   * seqNo counts frames the server has actually been *sent*, not frames
+   * received from Twilio, because close() passes it as
+   * EndOfChannel.last_seq_no - counting buffered-but-unsent or dropped
+   * frames would leave the server waiting for audio that never arrives.
+   *
+   * Returns false (rather than throwing) if the socket rejected the frame:
+   * callers run inside a ws "message" listener, where a throw escapes the
+   * promise chain and becomes a fatal uncaught exception.
+   */
+  private sendFrame(channel: Channel, base64Payload: string): boolean {
+    try {
+      this.client?.sendChannelAudio(channel, base64Payload);
+      this.seqNo[channel] += 1;
+      return true;
+    } catch (err) {
+      this.ready = false;
+      this.failed = true;
+      console.error(
+        `[speechmatics] ${channel}: send failed, abandoning audio for this call - ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Deliver every buffered frame in arrival order, or account for whatever
+   * cannot be delivered. Deliberately synchronous: no await between two
+   * frames means a concurrent enqueue() can never interleave itself into
+   * the middle of a flush, so per-channel ordering holds exactly.
+   */
+  private drainPending(): void {
+    for (const channel of CHANNELS) {
+      const queue = this.pending[channel];
+      this.pending[channel] = [];
+
+      let sent = 0;
+      while (sent < queue.length && this.ready && this.sendFrame(channel, queue[sent])) {
+        sent += 1;
+      }
+      if (sent > 0) {
+        console.log(`[speechmatics] ${channel}: flushed ${sent} buffered frame(s)`);
+      }
+      for (let i = sent; i < queue.length; i += 1) {
+        this.noteDrop(channel);
+      }
+    }
+  }
+
+  /**
+   * Count a dropped frame, shouting once per channel. At 50 frames/s a
+   * per-frame log would bury every other line in the console, but silence
+   * would hide real audio loss - so the first drop is loud and the total
+   * is reported again by close().
+   */
+  private noteDrop(channel: Channel): void {
+    this.dropped[channel] += 1;
+    if (this.dropped[channel] === 1) {
+      console.error(
+        `[speechmatics] ${channel}: dropping audio - session unusable or buffer full ` +
+          `(${MAX_BUFFERED_FRAMES_PER_CHANNEL} frames / ` +
+          `${(MAX_BUFFERED_FRAMES_PER_CHANNEL * 20) / 1000}s). ` +
+          `Transcripts for this call will have gaps.`,
+      );
+    }
   }
 
   private async run(): Promise<void> {
@@ -216,6 +352,17 @@ export class CallSession {
     });
 
     this.client = new MultiChannelRealtimeClient();
+
+    // The SDK dispatches socketStateChange when the socket is created, on
+    // error and on close - but *not* on open (see the RealtimeClient
+    // constructor in the installed SDK). It is therefore only useful as a
+    // "stop sending" signal; readiness comes from start() resolving below.
+    this.client.addEventListener("socketStateChange", ({ socketState }) => {
+      if (socketState === "closing" || socketState === "closed") {
+        this.ready = false;
+        this.failed = true;
+      }
+    });
 
     this.client.addEventListener("receiveMessage", ({ data }) => {
       if (data.message === "EndOfTranscript") {
@@ -251,13 +398,23 @@ export class CallSession {
     };
 
     try {
+      // start() resolves only once the server answers StartRecognition with
+      // RecognitionStarted, which means the socket is OPEN and the session
+      // is configured. That is the SDK's only trustworthy readiness signal,
+      // so it is the moment we unlock direct sends and flush the backlog.
       await this.client.start(jwt, startMsg);
+      this.ready = true;
+      this.drainPending();
     } catch (err) {
+      this.ready = false;
+      this.failed = true;
       if (!this.closed) {
         console.error(
           `Speechmatics session error: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
+      // Account for the backlog we will never be able to send.
+      this.drainPending();
     }
   }
 
@@ -320,33 +477,47 @@ export async function handleTwilioCall(ws: WebSocket): Promise<void> {
       return;
     }
 
-    switch (message.event) {
-      case "connected":
-        console.log("[twilio] protocol handshake ok");
-        break;
-      case "start": {
-        state.streamSid = message.start?.streamSid;
-        console.log(
-          `[twilio] call started - stream=${state.streamSid} call=${message.start?.callSid} tracks=${JSON.stringify(message.start?.tracks)}`,
-        );
-        state.session = new CallSession();
-        state.session.start();
-        break;
+    // This listener is invoked synchronously by ws's event emitter, so a
+    // throw in here does NOT reach the .catch() on handleTwilioCall's
+    // promise - it becomes an uncaught exception and kills the process,
+    // dropping every other call in flight. One bad event must cost us that
+    // event only, so the whole body is guarded and the error is logged
+    // rather than swallowed.
+    try {
+      switch (message.event) {
+        case "connected":
+          console.log("[twilio] protocol handshake ok");
+          break;
+        case "start": {
+          state.streamSid = message.start?.streamSid;
+          console.log(
+            `[twilio] call started - stream=${state.streamSid} call=${message.start?.callSid} tracks=${JSON.stringify(message.start?.tracks)}`,
+          );
+          state.session = new CallSession();
+          state.session.start();
+          break;
+        }
+        case "media": {
+          if (!state.session || !message.media?.payload) return;
+          // Twilio's `media.track` is always bare "inbound"/"outbound" -
+          // the "_track" suffix only appears in the TwiML attribute.
+          const track = message.media.track ?? "inbound";
+          // Base64 pass-through: Twilio's payload feeds AddChannelAudio.data
+          // as-is, no decode/re-encode needed.
+          state.session.enqueue(track, message.media.payload);
+          break;
+        }
+        case "stop":
+          console.log(`[twilio] call stopped (stream=${state.streamSid})`);
+          ws.close();
+          break;
       }
-      case "media": {
-        if (!state.session || !message.media?.payload) return;
-        // Twilio's `media.track` is always bare "inbound"/"outbound" -
-        // the "_track" suffix only appears in the TwiML attribute.
-        const track = message.media.track ?? "inbound";
-        // Base64 pass-through: Twilio's payload feeds AddChannelAudio.data
-        // as-is, no decode/re-encode needed.
-        state.session.enqueue(track, message.media.payload);
-        break;
-      }
-      case "stop":
-        console.log(`[twilio] call stopped (stream=${state.streamSid})`);
-        ws.close();
-        break;
+    } catch (err) {
+      console.error(
+        `[twilio] error handling "${message.event}" event: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
     }
   });
 
