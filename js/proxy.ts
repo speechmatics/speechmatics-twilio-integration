@@ -1,13 +1,13 @@
 /**
  * Twilio Voice <-> Speechmatics Realtime proxy server (multi-channel).
  *
- * Node.js/TypeScript sibling of ../proxy.py. Bridges Twilio Media Streams to
+ * Node.js/TypeScript sibling of ../python/proxy.py. Bridges Twilio Media Streams to
  * Speechmatics' Realtime API using channel diarization: each call produces
  * two per-speaker transcript streams (inbound / outbound), transcribed via
  * a single Speechmatics RT multi-channel session.
  *
  * Run:
- *     pnpm start          (or `npm start`)
+ *     npm start
  *
  * The server listens on localhost:<PORT>/twilio and, on startup, opens an
  * ngrok tunnel and points the configured Twilio number's Voice URL at the
