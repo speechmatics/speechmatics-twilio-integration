@@ -122,7 +122,7 @@ export async function checkSpeechmaticsKey(): Promise<void> {
   } catch (err) {
     console.error(
       `Could not authenticate with Speechmatics: ${err instanceof Error ? err.message : String(err)}\n` +
-        `Check SPEECHMATICS_API_KEY in .env (and that api.speechmatics.com is reachable). ` +
+        `Check SPEECHMATICS_API_KEY in .env (and that mp.speechmatics.com is reachable). ` +
         `Nothing has been started and your Twilio number has not been changed.`,
     );
     process.exit(1);
