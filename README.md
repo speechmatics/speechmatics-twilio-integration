@@ -48,8 +48,8 @@ matches your stack and follow the README in that folder:
 - The proxy relays those frames to Speechmatics Realtime — **no
   transcoding**, no re-encoding.
 - Speechmatics returns per-channel transcripts tagged with the track
-  they came from; the proxy prints them to the console with partials
-  overwriting in place and finals committing to new lines.
+  they came from; the proxy prints the finals to the console. Consecutive
+  finals on one channel continue on the same line, and a change of channel starts a new line. Partial transcripts are requested but not printed - the handlers are stubs for you to wire in.
 
 The language-specific READMEs cover prerequisites, setup, `.env` variables,
 what to expect at runtime, tests, and troubleshooting.
