@@ -288,3 +288,66 @@ async def test_no_session_ever_started_is_a_noop(fake_ws, mock_session):
 
     # No session was ever built, so close cannot have been called.
     instance.close.assert_not_awaited()
+
+
+async def test_undecodable_payload_drops_the_frame_not_the_call(
+    fake_ws, start_event, media_event, mock_session, capsys
+):
+    """
+    Scenario: One media frame has a malformed base64 payload
+        Given a call with a good frame, a bad frame, then another good frame
+         When handle_twilio_call consumes the stream
+         Then it does not raise
+          And both good frames still reach the session
+          And the bad frame is reported on stderr
+          And the session is still closed cleanly
+
+    Purpose:
+        base64.b64decode raised binascii.Error on a single bad payload,
+        which ended that call. A bad frame should cost one frame of audio.
+    """
+    _Session, instance = mock_session
+
+    bad = {"event": "media", "media": {"track": "inbound", "payload": "abcde"}}
+    ws = fake_ws(
+        [
+            start_event,
+            media_event("inbound", b"\x01\x02"),
+            bad,
+            media_event("inbound", b"\x03\x04"),
+            {"event": "stop"},
+        ]
+    )
+
+    await proxy.handle_twilio_call(ws)
+
+    # Both good frames arrived, in order, and the bad one did not.
+    assert [c.args[1] for c in instance.enqueue.call_args_list] == [b"\x01\x02", b"\x03\x04"]
+    instance.close.assert_awaited_once()
+
+    err = capsys.readouterr().err
+    assert "dropping undecodable audio frame" in err
+    assert "dropped 1 undecodable" in err
+
+
+async def test_many_bad_frames_log_once_and_are_tallied(
+    fake_ws, start_event, mock_session, capsys
+):
+    """
+    Scenario: A stream of malformed frames
+        Given five consecutive bad payloads
+         When handle_twilio_call consumes them
+         Then the per-frame warning is printed once
+          And the end-of-call tally says five were dropped
+
+    Purpose:
+        At 50 frames/s a per-frame log would bury every other line.
+    """
+    bad = {"event": "media", "media": {"track": "inbound", "payload": "abcde"}}
+    ws = fake_ws([start_event, *([bad] * 5), {"event": "stop"}])
+
+    await proxy.handle_twilio_call(ws)
+
+    err = capsys.readouterr().err
+    assert err.count("dropping undecodable audio frame") == 1
+    assert "dropped 5 undecodable" in err

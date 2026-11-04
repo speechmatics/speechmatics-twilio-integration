@@ -198,3 +198,45 @@ async def test_close_marks_session_closed_and_drains_sources():
     # future read() will get EOF instead of hanging.
     assert session.sources["inbound"]._closed
     assert session.sources["outbound"]._closed
+
+
+def test_consecutive_finals_on_one_channel_have_single_spaces(capsys):
+    """
+    Scenario: Several finals arrive in a row on one channel
+        Given transcript chunks that each end in a trailing space, as
+              Speechmatics sends them
+         When the session prints them back to back
+         Then the line reads "This call is being transcribed " with
+              single spaces between words
+
+    Purpose:
+        metadata.transcript is built for plain concatenation. Adding our
+        own separator on top printed "This  call is  being  transcribed".
+    """
+    session = CallSession()
+
+    for chunk in ("This call ", "is ", "being ", "transcribed "):
+        session._print_final("outbound", chunk)
+
+    out = capsys.readouterr().out
+    assert out == "[outbound] This call is being transcribed "
+    assert "  " not in out.replace("[outbound]", "").strip()
+
+
+def test_channel_change_starts_a_new_labelled_line(capsys):
+    """
+    Scenario: The speaker changes between finals
+        Given a final on "inbound" followed by one on "outbound"
+         When both are printed
+         Then the second starts on a new line with its own label
+
+    Purpose:
+        Guards the other two branches of _print_final, which the spacing
+        fix sits next to.
+    """
+    session = CallSession()
+
+    session._print_final("inbound", "Hello. ")
+    session._print_final("outbound", "Hi. ")
+
+    assert capsys.readouterr().out == "[inbound ] Hello. \n[outbound] Hi. "

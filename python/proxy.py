@@ -16,6 +16,7 @@ the tunnel's /twiml endpoint. Dial the Twilio number to trigger a call.
 
 import asyncio
 import base64
+import binascii
 import json
 import os
 import sys
@@ -30,6 +31,7 @@ from speechmatics.rt import (
     AudioEncoding,
     AudioFormat,
     AuthenticationError,
+    JWTAuth,
     Model,
     ServerMessageType,
     TranscriptionConfig,
@@ -132,6 +134,17 @@ class CallSession:
         if self._task:
             await self._task
 
+    def _print_final(self, channel: str, text: str) -> None:
+        """Print one final transcript chunk under its channel label."""
+        if self._last_final_channel is None:
+            sys.stdout.write(f"[{channel:<8}] {text}")
+        elif channel != self._last_final_channel:
+            sys.stdout.write(f"\n[{channel:<8}] {text}")
+        else:
+            sys.stdout.write(text)
+        self._last_final_channel = channel
+        sys.stdout.flush()
+
     async def _run(self) -> None:
         transcription_config = TranscriptionConfig(
             language=LANGUAGE,
@@ -163,14 +176,7 @@ class CallSession:
                     channel = msg.get("channel", "?")
                     if not text:
                         return
-                    if self._last_final_channel is None:
-                        sys.stdout.write(f"[{channel:<8}] {text}")
-                    elif channel != self._last_final_channel:
-                        sys.stdout.write(f"\n[{channel:<8}] {text}")
-                    else:
-                        sys.stdout.write(f" {text}")
-                    self._last_final_channel = channel
-                    sys.stdout.flush()
+                    self._print_final(channel, text)
 
                 await client.transcribe(
                     sources=self.sources,
@@ -203,6 +209,7 @@ async def handle_twilio_call(ws) -> None:
     """Consume a Twilio Media Streams WebSocket and pump audio into a session."""
     session: Optional[CallSession] = None
     stream_sid: Optional[str] = None
+    bad_frames = 0
 
     try:
         async for raw in ws:
@@ -227,7 +234,18 @@ async def handle_twilio_call(ws) -> None:
                 # Twilio's runtime `media.track` is always bare "inbound"/"outbound"
                 payload = media.get("payload")
                 if payload:
-                    session.enqueue(media.get("track", "inbound"), base64.b64decode(payload))
+                    try:
+                        frame = base64.b64decode(payload)
+                    except (binascii.Error, ValueError, TypeError) as e:
+                        bad_frames += 1
+                        if bad_frames == 1:
+                            print(
+                                f"[twilio] dropping undecodable audio frame ({e}); "
+                                "further bad frames are counted, not logged",
+                                file=sys.stderr,
+                            )
+                        continue
+                    session.enqueue(media.get("track", "inbound"), frame)
 
             elif event == "stop":
                 print(f"[twilio] call stopped (stream={stream_sid})")
@@ -236,6 +254,12 @@ async def handle_twilio_call(ws) -> None:
     except websockets.exceptions.ConnectionClosed:
         print(f"[twilio] connection closed (stream={stream_sid})")
     finally:
+        if bad_frames:
+            print(
+                f"[twilio] call ended having dropped {bad_frames} undecodable "
+                f"audio frame(s) (stream={stream_sid})",
+                file=sys.stderr,
+            )
         if session:
             await session.close()
 
@@ -249,6 +273,28 @@ def _check_env_vars() -> None:
     missing = [name for name in ENV_VARS if not os.getenv(name)]
     if missing:
         print(f"Missing required env vars in .env: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(1)
+
+
+async def _check_speechmatics_key() -> None:
+    """
+    Prove the Speechmatics key works before anything else is set up.
+
+    Without this, a bad key only surfaces on the first call - after ngrok is
+    up and the Twilio number has been repointed - so everything looks healthy
+    except the one thing that matters. Minting a short-lived token is the
+    cheapest request that rejects an invalid key. The token is discarded.
+    """
+    try:
+        await JWTAuth(SM_API_KEY, ttl=60).get_auth_headers()
+    except AuthenticationError as e:
+        print(
+            f"Could not authenticate with Speechmatics: {e}\n"
+            "Check SPEECHMATICS_API_KEY in .env (and that mp.speechmatics.com is "
+            "reachable). Nothing has been started and your Twilio number has not "
+            "been changed.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 
@@ -288,6 +334,7 @@ async def _configure_twilio_number(twiml_url: str) -> None:
 
 async def main() -> None:
     _check_env_vars()
+    await _check_speechmatics_key()
 
     base_url = await _start_ngrok_tunnel()
     wss_url = base_url.replace("https://", "wss://") + "/twilio"
